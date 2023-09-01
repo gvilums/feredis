@@ -1,4 +1,5 @@
 pub mod expire;
+pub mod item;
 
 use std::collections::{HashMap, VecDeque};
 
@@ -341,6 +342,26 @@ fn do_expire(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem
     Integer(1)
 }
 
+fn do_rename(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
+    use RedisItem::*;
+    let Some(BulkString(key)) = args.pop_front() else {
+        return SimpleError("invalid arguments".to_string());
+    };
+    let Some(BulkString(new_key)) = args.pop_front() else {
+        return SimpleError("invalid arguments".to_string());
+    };
+    let mut state = state.borrow_mut();
+    if let Some((val, id)) = state.items.remove(&key) {
+        if let Some(exp) = state.expire.get_expiry(id) {
+            state.expire.push(new_key.clone(), id, exp);
+        }
+        state.items.insert(new_key, (val, id));
+        SimpleString("OK".to_string())
+    } else {
+        SimpleError("no such key".to_string())
+    }
+}
+
 fn do_rpush(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
     use RedisItem::*;
     let Some(BulkString(key)) = args.pop_front() else {
@@ -425,6 +446,7 @@ fn handle_command(command: RedisItem, state: &RefCell<State>) -> RedisItem {
                 "get" => do_get,
                 "del" => do_del,
                 "expire" => do_expire,
+                "rename" => do_rename,
                 "rpush" => do_rpush,
                 "rpop" => do_rpop,
                 _ => return SimpleError("unknown command".to_string()),
