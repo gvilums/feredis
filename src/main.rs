@@ -1,46 +1,39 @@
 pub mod blocking;
+pub mod expire;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 
 use std::cell::RefCell;
 use std::net::{TcpListener, TcpStream};
+use std::task::Waker;
+use std::time::Instant;
 
-use smol::io::{*, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use smol::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use smol::{Async, Timer};
+use std::io;
 
-struct State {
+use smol::stream::StreamExt;
+
+use expire::Expire;
+
+use crate::expire::ExpireResult;
+
+#[derive(Debug)]
+pub struct State {
+    stop: bool,
     items: HashMap<String, RedisItem>,
+    expire: Expire,
 }
 
 impl State {
     fn new() -> Self {
         Self {
+            stop: false,
             items: HashMap::new(),
+            expire: Expire::new(),
         }
     }
 }
-
-// enum NewItem<'a> {
-//     SimpleString(&'a str),
-//     SimpleError(&'a str),
-//     Integer(i64),
-//     BulkString(&'a str),
-//     Array(Vec<NewItem<'a>>),
-//     Null,
-//     Boolean(bool),
-//     Double(f64),
-// }
-
-// enum RawItem {
-//     SimpleString(usize, usize),
-//     SimpleError(usize, usize),
-//     Integer(usize, usize),
-//     BulkString(usize, usize),
-//     Array(usize, usize),
-//     Null,
-//     Boolean(bool),
-//     Double(usize, usize),
-// }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 enum RedisItem {
@@ -103,31 +96,6 @@ impl RedisItem {
             // },
         }
     }
-    // #[async_recursion::async_recursion(?Send)]
-    // async fn from_stream(stream: &mut BufReader<&Async<TcpStream>>, buffer: &mut Vec<u8>) -> io::Result<Self> {
-    //     buffer.clear();
-    //     let count = stream.read_until(b'\n', buffer).await?;
-    //     assert!(count >= 3); // at least _\r\n
-    //     match buffer[0] {
-    //         b'$' => {
-    //             // let len = std::str::from_utf8(&buffer[1..count-2]).unwrap().parse::<u32>().unwrap();
-    //             buffer.clear();
-    //             let count = stream.read_until(b'\n', buffer).await?;
-    //             return Ok(Self::BulkString(std::str::from_utf8(&buffer[..count-2]).unwrap().to_string()))
-    //         },
-    //         b'*' => {
-    //             let len = std::str::from_utf8(&buffer[1..count-2]).unwrap().parse::<u32>().unwrap();
-    //             let mut items = Vec::new();
-    //             for _ in 0..len {
-    //                 items.push(Self::from_stream(stream, buffer).await?);
-    //             }
-    //             return Ok(Self::List(items))
-    //         },
-    //         _ => {
-    //             panic!("unknown command");
-    //         }
-    //     }
-    // }
 }
 
 enum ParseState {
@@ -284,11 +252,11 @@ impl ItemParser {
     }
 }
 
-fn handle_ping(_: VecDeque<RedisItem>, _: &RefCell<State>) -> RedisItem {
+fn do_ping(_: VecDeque<RedisItem>, _: &RefCell<State>) -> RedisItem {
     RedisItem::SimpleString("PONG".to_string())
 }
 
-fn handle_set(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
+fn do_set(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
     use RedisItem::*;
     let Some(BulkString(key)) = args.pop_front() else {
         return SimpleError("invalid arguments".to_string());
@@ -300,7 +268,7 @@ fn handle_set(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisIte
     SimpleString("OK".to_string())
 }
 
-fn handle_get(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
+fn do_get(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
     use RedisItem::*;
     let Some(BulkString(key)) = args.pop_front() else {
         return SimpleError("invalid arguments".to_string());
@@ -312,7 +280,7 @@ fn handle_get(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisIte
     }
 }
 
-fn handle_del(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
+fn do_del(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
     use RedisItem::*;
     let mut counter = 0;
     while let Some(item) = args.pop_front() {
@@ -326,7 +294,23 @@ fn handle_del(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisIte
     Integer(counter)
 }
 
-fn handle_rpush(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
+fn do_expire(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
+    use RedisItem::*;
+    let Some(BulkString(key)) = args.pop_front() else {
+        return SimpleError("invalid arguments".to_string());
+    };
+    let Some(BulkString(val)) = args.pop_front() else {
+        return SimpleError("invalid arguments".to_string());
+    };
+    let Ok(time) = val.parse::<u64>() else {
+        return SimpleError("invalid arguments".to_string());
+    };
+    let time = Instant::now() + std::time::Duration::from_secs(time);
+    state.borrow_mut().expire.push(key, time);
+    Integer(1)
+}
+
+fn do_rpush(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
     use RedisItem::*;
     let Some(BulkString(key)) = args.pop_front() else {
         return SimpleError("invalid arguments".to_string());
@@ -342,7 +326,7 @@ fn handle_rpush(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisI
     Integer(items.len() as i64)
 }
 
-fn handle_rpop(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
+fn do_rpop(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
     enum PopCount {
         Single,
         Count(usize),
@@ -403,12 +387,13 @@ fn handle_command(command: RedisItem, state: &RefCell<State>) -> RedisItem {
             };
             command.make_ascii_lowercase();
             let handler = match command.as_str() {
-                "ping" => handle_ping,
-                "set" => handle_set,
-                "get" => handle_get,
-                "del" => handle_del,
-                "rpush" => handle_rpush,
-                "rpop" => handle_rpop,
+                "ping" => do_ping,
+                "set" => do_set,
+                "get" => do_get,
+                "del" => do_del,
+                "expire" => do_expire,
+                "rpush" => do_rpush,
+                "rpop" => do_rpop,
                 _ => return SimpleError("unknown command".to_string()),
             };
             handler(args, state)
@@ -432,7 +417,6 @@ async fn handle_connection(stream: Async<TcpStream>, state: &RefCell<State>) -> 
             }
             Err(ParseError::IoError(err)) => return Err(err),
             Ok(command) => {
-                dbg!(&command);
                 let res = handle_command(command, state);
                 out_buffer.clear();
                 res.serialize(&mut out_buffer);
@@ -443,19 +427,42 @@ async fn handle_connection(stream: Async<TcpStream>, state: &RefCell<State>) -> 
     // Ok(())
 }
 
-async fn handle_expire(state: &RefCell<State>) {
-
+async fn expire_worker(state: &RefCell<State>) {
+    use smol::future::or;
+    loop {
+        println!("polling future");
+        let res = or(
+            expire::expire(state),
+            or(expire::retry(state), expire::check(state)),
+        )
+        .await;
+        println!("future polled, res: {:?}", &res);
+        let mut state = state.borrow_mut();
+        match res {
+            ExpireResult::Expired(key) => {
+                state.items.remove(&key);
+            }
+            ExpireResult::Updated | ExpireResult::Check => {
+                if let Some(waker) = state.expire.waker.as_ref() {
+                    waker.clone().wake();
+                }
+            }
+        }
+        if state.stop {
+            break;
+        }
+    }
 }
 
 fn main() -> io::Result<()> {
     let state = RefCell::new(State::new());
     let exec = smol::LocalExecutor::new();
     // blocking::main()
+    exec.spawn(expire_worker(&state)).detach();
     smol::block_on(exec.run(async {
         // Create a listener.
         let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 7000))?;
         println!("Listening on {}", listener.get_ref().local_addr()?);
-        println!("Now start a TCP client.");
 
         // Accept clients in a loop.
         loop {
