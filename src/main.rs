@@ -1,22 +1,17 @@
-pub mod blocking;
 pub mod expire;
 
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use std::cell::RefCell;
 use std::net::{TcpListener, TcpStream};
-use std::task::Waker;
 use std::time::Instant;
 
 use smol::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use smol::{Async, Timer};
+use smol::Async;
 use std::io;
 
-use smol::stream::StreamExt;
 
 use expire::Expire;
-
-use crate::expire::ExpireResult;
 
 #[derive(Debug)]
 pub struct State {
@@ -403,7 +398,7 @@ fn handle_command(command: RedisItem, state: &RefCell<State>) -> RedisItem {
 }
 
 /// Echoes messages from the client back to it.
-async fn handle_connection(stream: Async<TcpStream>, state: &RefCell<State>) -> io::Result<()> {
+async fn connection_worker(stream: Async<TcpStream>, state: &RefCell<State>) -> io::Result<()> {
     let mut reader = BufReader::new(&stream);
     let mut writer = &stream;
 
@@ -427,38 +422,10 @@ async fn handle_connection(stream: Async<TcpStream>, state: &RefCell<State>) -> 
     // Ok(())
 }
 
-async fn expire_worker(state: &RefCell<State>) {
-    use smol::future::or;
-    loop {
-        println!("polling future");
-        let res = or(
-            expire::expire(state),
-            or(expire::retry(state), expire::check(state)),
-        )
-        .await;
-        println!("future polled, res: {:?}", &res);
-        let mut state = state.borrow_mut();
-        match res {
-            ExpireResult::Expired(key) => {
-                state.items.remove(&key);
-            }
-            ExpireResult::Updated | ExpireResult::Check => {
-                if let Some(waker) = state.expire.waker.as_ref() {
-                    waker.clone().wake();
-                }
-            }
-        }
-        if state.stop {
-            break;
-        }
-    }
-}
-
 fn main() -> io::Result<()> {
     let state = RefCell::new(State::new());
     let exec = smol::LocalExecutor::new();
-    // blocking::main()
-    exec.spawn(expire_worker(&state)).detach();
+    exec.spawn(expire::expire_worker(&state)).detach();
     smol::block_on(exec.run(async {
         // Create a listener.
         let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 7000))?;
@@ -468,9 +435,7 @@ fn main() -> io::Result<()> {
         loop {
             let (stream, peer_addr) = listener.accept().await?;
             println!("Accepted client: {}", peer_addr);
-            exec.spawn(handle_connection(stream, &state)).detach();
+            exec.spawn(connection_worker(stream, &state)).detach();
         }
     }))
-    // println!("counter: {}", counter.borrow());
-    // Ok(())
 }
