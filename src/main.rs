@@ -16,8 +16,16 @@ use expire::Expire;
 #[derive(Debug)]
 pub struct State {
     stop: bool,
-    items: HashMap<String, RedisItem>,
+    items: HashMap<String, (RedisItem, u64)>,
     expire: Expire,
+    counter: u64,
+}
+
+struct ItemStore {
+    // keys: HashMap<String, usize>,
+    // items: HashMap<usize, RedisItem>,
+    items: HashMap<String, (RedisItem, u64)>,
+    counter: u64,
 }
 
 impl State {
@@ -26,6 +34,7 @@ impl State {
             stop: false,
             items: HashMap::new(),
             expire: Expire::new(),
+            counter: 0,
         }
     }
 }
@@ -247,6 +256,27 @@ impl ItemParser {
     }
 }
 
+#[derive(Debug)]
+enum RedisError {
+    InvalidCommand,
+    InvalidArguments,
+    WrongType,
+    UnknownCommand,
+}
+
+impl From<RedisError> for RedisItem {
+    fn from(value: RedisError) -> Self {
+        use RedisError::*;
+        use RedisItem::SimpleError;
+        match value {
+            InvalidCommand => SimpleError("invalid command".to_string()),
+            InvalidArguments => SimpleError("invalid arguments".to_string()),
+            WrongType => SimpleError("WRONGTYPE".to_string()),
+            UnknownCommand => SimpleError("unknown command".to_string()),
+        }
+    }
+}
+
 fn do_ping(_: VecDeque<RedisItem>, _: &RefCell<State>) -> RedisItem {
     RedisItem::SimpleString("PONG".to_string())
 }
@@ -259,7 +289,10 @@ fn do_set(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
     let Some(val @ BulkString(_)) = args.pop_front() else {
         return SimpleError("invalid arguments".to_string());
     };
-    state.borrow_mut().items.insert(key, val);
+    let mut state = state.borrow_mut();
+    let id = state.counter;
+    state.items.insert(key, (val, id));
+    state.counter += 1;
     SimpleString("OK".to_string())
 }
 
@@ -268,7 +301,7 @@ fn do_get(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
     let Some(BulkString(key)) = args.pop_front() else {
         return SimpleError("invalid arguments".to_string());
     };
-    match state.borrow().items.get(&key) {
+    match state.borrow().items.get(&key).map(|(val, _)| val) {
         Some(BulkString(val)) => BulkString(val.clone()),
         Some(_) => SimpleError("value is not a string".to_string()),
         None => Null,
@@ -300,8 +333,11 @@ fn do_expire(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem
     let Ok(time) = val.parse::<u64>() else {
         return SimpleError("invalid arguments".to_string());
     };
+    let Some(id) = state.borrow().items.get(&key).map(|(_, id)| *id) else {
+        return Integer(0)
+    };
     let time = Instant::now() + std::time::Duration::from_secs(time);
-    state.borrow_mut().expire.push(key, time);
+    state.borrow_mut().expire.push(key, id, time);
     Integer(1)
 }
 
@@ -311,8 +347,10 @@ fn do_rpush(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem 
         return SimpleError("invalid arguments".to_string());
     };
     let mut state = state.borrow_mut();
-    let entry = state.items.entry(key).or_insert_with(|| Array(Vec::new()));
-    let Array(items) = entry else {
+    let id = state.counter;
+    state.counter += 1;
+    let entry = state.items.entry(key).or_insert_with(|| (Array(Vec::new()), id));
+    let (Array(items), _) = entry else {
         return SimpleError("WRONGTYPE".to_string());
     };
     while let Some(item) = args.pop_front() {
@@ -347,7 +385,7 @@ fn do_rpop(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
         _ => return SimpleError("invalid arguments".to_string()),
     };
     let mut state = state.borrow_mut();
-    let Some(Array(items)) = state.items.get_mut(&key) else {
+    let Some((Array(items), _)) = state.items.get_mut(&key) else {
         return Null;
     };
     // empty lists should not exist
