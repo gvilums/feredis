@@ -21,8 +21,8 @@ pub async fn expire_worker(state: &RefCell<State>) {
         // pop all expired items
         while let Some(exp) = state.expire.try_pop() {
             // if the item is the latest version, remove it
-            if let Some(id) = state.items.get(&exp.key).map(|it| it.1) {
-                if id == exp.id {
+            if let Some(tag) = state.items.get(&exp.key).map(|it| it.1) {
+                if tag == exp.tag {
                     println!("Expired: {}", &exp.key);
                     state.items.remove(&exp.key);
                 } else {
@@ -54,12 +54,12 @@ impl Expire {
         }
     }
 
-    pub fn push(&mut self, key: String, id: u64, time: Instant) {
+    pub fn push(&mut self, key: String, tag: u64, time: Instant) {
         // get the previously closest expiry time
         let prev_exp = self.items.peek().map(|e| e.0.time);
         // add new expire for key
-        self.items.push(Reverse(Expiry { key, time, id }));
-        self.expiries.insert(id, time);
+        self.items.push(Reverse(Expiry { key, time, tag }));
+        self.expiries.insert(tag, time);
         // if the new expiry time is closer than the previous one, wake the worker
         if prev_exp.map(|e| e > time).unwrap_or(true) {
             self.updated = true;
@@ -74,15 +74,15 @@ impl Expire {
         if exp <= Instant::now() {
             let ex = self.items.pop()?.0;
             println!("Popped: {}", &ex.key);
-            self.expiries.remove(&ex.id);
+            self.expiries.remove(&ex.tag);
             Some(ex)
         } else {
             None
         }
     }
 
-    pub fn get_expiry(&self, id: u64) -> Option<Instant> {
-        self.expiries.get(&id).copied()
+    pub fn get_expiry(&self, tag: u64) -> Option<Instant> {
+        self.expiries.get(&tag).copied()
     }
 }
 
@@ -134,7 +134,7 @@ impl<'a> Future for UpdateFuture<'a> {
 #[derive(Debug)]
 struct Expiry {
     key: String,
-    id: u64,
+    tag: u64,
     time: Instant,
 }
 

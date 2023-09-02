@@ -19,7 +19,7 @@ pub struct State {
     stop: bool,
     items: HashMap<String, (RedisItem, u64)>,
     expire: Expire,
-    counter: u64,
+    tag_counter: u64,
 }
 
 struct ItemStore {
@@ -35,7 +35,7 @@ impl State {
             stop: false,
             items: HashMap::new(),
             expire: Expire::new(),
-            counter: 0,
+            tag_counter: 0,
         }
     }
 }
@@ -79,9 +79,9 @@ fn do_set(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
         return SimpleError("invalid arguments".to_string());
     };
     let mut state = state.borrow_mut();
-    let id = state.counter;
-    state.items.insert(key, (val, id));
-    state.counter += 1;
+    let tag = state.tag_counter;
+    state.items.insert(key, (val, tag));
+    state.tag_counter += 1;
     SimpleString("OK".to_string())
 }
 
@@ -122,12 +122,39 @@ fn do_expire(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem
     let Ok(time) = val.parse::<u64>() else {
         return SimpleError("invalid arguments".to_string());
     };
-    let Some(id) = state.borrow().items.get(&key).map(|(_, id)| *id) else {
+    let Some(tag) = state.borrow().items.get(&key).map(|(_, tag)| *tag) else {
         return Integer(0)
     };
     let time = Instant::now() + std::time::Duration::from_secs(time);
-    state.borrow_mut().expire.push(key, id, time);
+    let mut state = state.borrow_mut();
+    let state = &mut *state;
+    if let Some(_) = state.expire.get_expiry(tag) {
+        let (_, tag_mut) = state.items.get_mut(&key).unwrap();
+        *tag_mut = state.tag_counter;
+        state.tag_counter += 1;
+        state.expire.push(key, *tag_mut, time);
+    } else {
+        state.expire.push(key, tag, time);
+    }
     Integer(1)
+}
+
+fn do_persist(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
+    use RedisItem::*;
+    let Some(BulkString(key)) = args.pop_front() else {
+        return SimpleError("invalid arguments".to_string());
+    };
+    let mut state = state.borrow_mut();
+    let state = &mut *state;
+    // by updating the tag we give the item a new "identity",
+    // preventing it from being expired
+    if let Some((_, tag)) = state.items.get_mut(&key) {
+        *tag = state.tag_counter;
+        state.tag_counter += 1;
+        Integer(1)
+    } else {
+        Integer(0)
+    }
 }
 
 fn do_rename(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem {
@@ -139,11 +166,11 @@ fn do_rename(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem
         return SimpleError("invalid arguments".to_string());
     };
     let mut state = state.borrow_mut();
-    if let Some((val, id)) = state.items.remove(&key) {
-        if let Some(exp) = state.expire.get_expiry(id) {
-            state.expire.push(new_key.clone(), id, exp);
+    if let Some((val, tag)) = state.items.remove(&key) {
+        if let Some(exp) = state.expire.get_expiry(tag) {
+            state.expire.push(new_key.clone(), tag, exp);
         }
-        state.items.insert(new_key, (val, id));
+        state.items.insert(new_key, (val, tag));
         SimpleString("OK".to_string())
     } else {
         SimpleError("no such key".to_string())
@@ -156,12 +183,12 @@ fn do_rpush(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem 
         return SimpleError("invalid arguments".to_string());
     };
     let mut state = state.borrow_mut();
-    let id = state.counter;
-    state.counter += 1;
+    let tag = state.tag_counter;
+    state.tag_counter += 1;
     let entry = state
         .items
         .entry(key)
-        .or_insert_with(|| (Array(Vec::new()), id));
+        .or_insert_with(|| (Array(Vec::new()), tag));
     let (Array(items), _) = entry else {
         return SimpleError("WRONGTYPE".to_string());
     };
@@ -237,6 +264,7 @@ fn handle_command(command: RedisItem, state: &RefCell<State>) -> RedisItem {
                 "get" => do_get,
                 "del" => do_del,
                 "expire" => do_expire,
+                "persist" => do_persist,
                 "rename" => do_rename,
                 "rpush" => do_rpush,
                 "rpop" => do_rpop,
