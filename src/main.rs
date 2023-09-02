@@ -11,7 +11,6 @@ use smol::io::{AsyncWriteExt, BufReader};
 use smol::Async;
 use std::io;
 
-
 use expire::Expire;
 use item::RedisItem;
 
@@ -40,7 +39,6 @@ impl State {
         }
     }
 }
-
 
 #[derive(Debug)]
 enum RedisError {
@@ -160,7 +158,10 @@ fn do_rpush(mut args: VecDeque<RedisItem>, state: &RefCell<State>) -> RedisItem 
     let mut state = state.borrow_mut();
     let id = state.counter;
     state.counter += 1;
-    let entry = state.items.entry(key).or_insert_with(|| (Array(Vec::new()), id));
+    let entry = state
+        .items
+        .entry(key)
+        .or_insert_with(|| (Array(Vec::new()), id));
     let (Array(items), _) = entry else {
         return SimpleError("WRONGTYPE".to_string());
     };
@@ -248,36 +249,38 @@ fn handle_command(command: RedisItem, state: &RefCell<State>) -> RedisItem {
 }
 
 async fn connection_worker(stream: Async<TcpStream>, state: &RefCell<State>) -> io::Result<()> {
-    use item::{ParseError, ItemParser};
+    use item::{ItemParser, ParseError};
     let mut reader = BufReader::new(&stream);
     let mut writer = &stream;
 
     let mut parser = ItemParser::new();
     let mut out_buffer = Vec::new();
     loop {
-        match parser.parse(&mut reader).await {
+        let res = match parser.parse(&mut reader).await {
+            Ok(command) => handle_command(command, state),
             Err(ParseError::Incomplete | ParseError::Invalid) => {
-                writer.write_all(b"-ERR\r\n").await?;
-                continue;
+                RedisItem::SimpleError("ERR".to_string())
             }
             Err(ParseError::IoError(err)) => return Err(err),
-            Ok(command) => {
-                let res = handle_command(command, state);
-                out_buffer.clear();
-                res.serialize(&mut out_buffer);
-                writer.write_all(&out_buffer[..]).await?;
-            }
-        }
+        };
+        out_buffer.clear();
+        res.serialize(&mut out_buffer);
+        writer.write_all(&out_buffer[..]).await?;
     }
 }
 
 fn main() -> io::Result<()> {
+    let port = std::env::var("PORT")
+        .map_or(Ok(7000), |s| s.parse::<u16>())
+        .expect("port must be a number");
+
+
     let state = RefCell::new(State::new());
     let exec = smol::LocalExecutor::new();
     exec.spawn(expire::expire_worker(&state)).detach();
     smol::block_on(exec.run(async {
         // Create a listener.
-        let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], 7000))?;
+        let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], port))?;
         println!("Listening on {}", listener.get_ref().local_addr()?);
 
         // Accept clients in a loop.
