@@ -209,6 +209,10 @@ dependencies = [
 [[package]]
 name = "feredis-cli"
 version = "0.1.0"
+dependencies = [
+ "feredis-core",
+ "smol",
+]
 
 [[package]]
 name = "feredis-core"

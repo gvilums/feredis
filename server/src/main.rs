@@ -292,13 +292,15 @@ async fn connection_worker(stream: Async<TcpStream>, state: &RefCell<State>) -> 
         };
         out_buffer.clear();
         res.serialize(&mut out_buffer);
+        println!("writing response of length {}", out_buffer.len());
         writer.write_all(&out_buffer[..]).await?;
+        println!("wrote response");
     }
 }
 
 fn main() -> io::Result<()> {
     let port = std::env::var("PORT")
-        .map_or(Ok(7000), |s| s.parse::<u16>())
+        .map_or(Ok(9000), |s| s.parse::<u16>())
         .expect("port must be a number");
 
 
@@ -307,7 +309,7 @@ fn main() -> io::Result<()> {
     exec.spawn(expire::expire_worker(&state)).detach();
     smol::block_on(exec.run(async {
         // Create a listener.
-        let listener = Async::<TcpListener>::bind(([127, 0, 0, 1], port))?;
+        let listener = Async::<TcpListener>::bind(([0, 0, 0, 0], port))?;
         println!("Listening on {}", listener.get_ref().local_addr()?);
 
         // Accept clients in a loop.
