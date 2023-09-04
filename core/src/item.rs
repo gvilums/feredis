@@ -1,9 +1,6 @@
 use std::io;
 
-use std::net::TcpStream;
-
-use smol::io::{AsyncBufReadExt, BufReader};
-use smol::Async;
+use smol::io::{AsyncBufRead, AsyncBufReadExt};
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum RedisItem {
@@ -68,6 +65,7 @@ impl RedisItem {
     }
 }
 
+#[derive(Debug)]
 enum ParseState {
     List {
         remaining: usize,
@@ -79,6 +77,7 @@ enum ParseState {
     // },
 }
 
+#[derive(Debug)]
 enum ParseResult {
     Partial(ParseState),
     Complete(RedisItem),
@@ -89,6 +88,7 @@ pub struct ItemParser {
     stack: Vec<ParseState>,
 }
 
+#[derive(Debug)]
 pub enum ParseError {
     Incomplete,
     Invalid,
@@ -111,7 +111,7 @@ impl ItemParser {
 
     async fn parse_partial(
         &mut self,
-        stream: &mut BufReader<&Async<TcpStream>>,
+        stream: &mut (impl AsyncBufRead + Unpin),
     ) -> Result<ParseResult, ParseError> {
         self.buffer.clear();
         let read0 = stream.read_until(b'\n', &mut self.buffer).await?;
@@ -139,12 +139,7 @@ impl ItemParser {
                 )))
             }
             x @ (b'-' | b'+' | b':') => {
-                self.buffer.clear();
-                let read1 = stream.read_until(b'\n', &mut self.buffer).await?;
-                if read1 < 2 {
-                    return Err(ParseError::Incomplete);
-                }
-                let Ok(strval) = std::str::from_utf8(&self.buffer[..read1-2]) else {
+                let Ok(strval) = std::str::from_utf8(&self.buffer[1..read0-2]) else {
                     return Err(ParseError::Invalid)
                 };
                 let str = strval.to_string();
@@ -163,9 +158,9 @@ impl ItemParser {
             }
             b'*' => {
                 let len = std::str::from_utf8(&self.buffer[1..read0 - 2])
-                    .unwrap()
+                    .map_err(|_| ParseError::Invalid)?
                     .parse::<u32>()
-                    .unwrap();
+                    .map_err(|_| ParseError::Invalid)?;
                 Ok(ParseResult::Partial(ParseState::List {
                     remaining: len as usize,
                     items: Vec::new(),
@@ -175,10 +170,10 @@ impl ItemParser {
         }
     }
 
-    pub async fn parse(
-        &mut self,
-        stream: &mut BufReader<&Async<TcpStream>>,
-    ) -> Result<RedisItem, ParseError> {
+    pub async fn parse<T>(&mut self, stream: &mut T) -> Result<RedisItem, ParseError>
+    where
+        T: AsyncBufRead + Unpin,
+    {
         self.buffer.clear();
         self.stack.clear();
 
@@ -192,8 +187,22 @@ impl ItemParser {
             }
         }
 
-        while let Some(state) = self.stack.pop() {
-            let res = self.parse_partial(stream).await?;
+        while let Some(mut state) = self.stack.pop() {
+            let res = if let ParseState::List {
+                remaining: 0,
+                items,
+            } = state
+            {
+                let res = RedisItem::Array(items);
+                if let Some(newstate) = self.stack.pop() {
+                    state = newstate;
+                } else {
+                    return Ok(res);
+                }
+                ParseResult::Complete(res)
+            } else {
+                self.parse_partial(stream).await?
+            };
             match (res, state) {
                 (ParseResult::Partial(new_state), s) => {
                     self.stack.push(s);
@@ -207,8 +216,8 @@ impl ItemParser {
                     },
                 ) => {
                     items.push(value);
-                    if remaining == 1 {
-                        return Ok(RedisItem::Array(items));
+                    if remaining == 0 {
+                        return Err(ParseError::Invalid);
                     } else {
                         self.stack.push(ParseState::List {
                             remaining: remaining - 1,
@@ -219,5 +228,82 @@ impl ItemParser {
             }
         }
         Err(ParseError::Incomplete)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn parse(input: &[u8]) -> Result<RedisItem, ParseError> {
+        let mut parser = ItemParser::new();
+        let mut stream = smol::io::Cursor::new(input);
+        smol::block_on(parser.parse(&mut stream))
+    }
+
+    #[test]
+    pub fn test_parse_simple() {
+        let res = parse(b"+OK\r\n").unwrap();
+        assert_eq!(res, RedisItem::SimpleString("OK".to_string()));
+    }
+
+    #[test]
+    pub fn test_parse_error() {
+        let res = parse(b"-MYERROR\r\n").unwrap();
+        assert_eq!(res, RedisItem::SimpleError("MYERROR".to_string()));
+    }
+
+    #[test]
+    pub fn test_parse_integer() {
+        let res = parse(b":12345\r\n").unwrap();
+        assert_eq!(res, RedisItem::Integer(12345));
+    }
+
+    #[test]
+    pub fn test_parse_bulk_string() {
+        let res = parse(b"$6\r\nfoobar\r\n").unwrap();
+        assert_eq!(res, RedisItem::BulkString("foobar".to_string()));
+    }
+
+    #[test]
+    pub fn test_parse_array() {
+        let res = parse(b"*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n").unwrap();
+        assert_eq!(
+            res,
+            RedisItem::Array(vec![
+                RedisItem::BulkString("foo".to_string()),
+                RedisItem::BulkString("bar".to_string())
+            ])
+        );
+    }
+
+    #[test]
+    pub fn test_parse_nested_array() {
+        let res = parse(b"*2\r\n*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n$3\r\nbaz\r\n").unwrap();
+        assert_eq!(
+            res,
+            RedisItem::Array(vec![
+                RedisItem::Array(vec![
+                    RedisItem::BulkString("foo".to_string()),
+                    RedisItem::BulkString("bar".to_string())
+                ]),
+                RedisItem::BulkString("baz".to_string())
+            ])
+        );
+    }
+
+    #[test]
+    pub fn test_parse_null() {
+        let res = parse(b"_\r\n").unwrap();
+        assert_eq!(res, RedisItem::Null);
+    }
+
+    #[test]
+    pub fn test_parse_boolean() {
+        let res_true = parse(b"#t\r\n").unwrap();
+        assert_eq!(res_true, RedisItem::Boolean(true));
+
+        let res_false = parse(b"#f\r\n").unwrap();
+        assert_eq!(res_false, RedisItem::Boolean(false));
     }
 }

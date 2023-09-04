@@ -1,5 +1,4 @@
 pub mod expire;
-pub mod item;
 
 use std::collections::{HashMap, VecDeque};
 
@@ -12,7 +11,7 @@ use smol::Async;
 use std::io;
 
 use expire::Expire;
-use item::RedisItem;
+use feredis_core::item::RedisItem;
 
 #[derive(Debug)]
 pub struct State {
@@ -277,7 +276,7 @@ fn handle_command(command: RedisItem, state: &RefCell<State>) -> RedisItem {
 }
 
 async fn connection_worker(stream: Async<TcpStream>, state: &RefCell<State>) -> io::Result<()> {
-    use item::{ItemParser, ParseError};
+    use feredis_core::item::{ItemParser, ParseError};
     let mut reader = BufReader::new(&stream);
     let mut writer = &stream;
 
